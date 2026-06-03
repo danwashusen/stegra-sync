@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import typer
 from rich.console import Console
@@ -16,8 +17,9 @@ from rich.progress import (
 from rich.table import Table
 
 from . import auth as auth_mod
-from . import diff as diff_mod
-from . import dmd as dmd_mod
+from . import local_apply as local_apply_mod
+from . import local_diff as local_diff_mod
+from . import local_target as local_target_mod
 from . import stegra as stegra_mod
 from .plan import SyncPlan
 
@@ -203,77 +205,48 @@ def _print_overview(snapshot) -> None:  # type: ignore[no-untyped-def]
 
 @app.command()
 def inspect(
-    workdir: Path = typer.Option(DEFAULT_WORKDIR, "--workdir", "-w"),
+    target: Path = typer.Option(..., "--target", "-t",
+        help="Path to the local target folder to inspect."),
 ) -> None:
-    """Enumerate DMD Hub folders + GPX records into snapshots/dmd.json."""
-    bundle = _require_auth()
-    snapshots_dir = workdir / "snapshots"
+    """Read the local target's manifest and show its current state."""
+    target.mkdir(parents=True, exist_ok=True)
+    manifest = local_target_mod.scan_target(target)
+    if not manifest.entries and not manifest.folder_names:
+        console.print(f"[dim]Target {target} has no manifest yet (first sync will create one).[/dim]")
+        return
+    by_collection: dict[str, int] = {}
+    for e in manifest.entries:
+        by_collection[e.collection_id] = by_collection.get(e.collection_id, 0) + 1
 
-    console.print("[bold]→ Enumerating DMD Hub library...[/bold]")
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        TimeElapsedColumn(),
-        console=console,
-        transient=True,
-    ) as progress:
-        task_id = progress.add_task("Listing", total=None)
-        def on_progress(phase: str, idx: int, total: int, label: str) -> None:
-            progress.update(task_id, description=f"Listing — {label}")
-        try:
-            snapshot = dmd_mod.fetch_snapshot(bundle, on_progress=on_progress)
-        except dmd_mod.DmdAuthError as e:
-            console.print(f"[red]{e}[/red]")
-            raise typer.Exit(code=2)
-
-    out_path = dmd_mod.write_snapshot(snapshot, snapshots_dir)
-
-    # Summary counts (excluding the synthetic Root folder, which is always there)
-    user_folder_count = max(0, len(snapshot.folders) - 1)
-    managed = sum(1 for g in snapshot.gpx.values() if g.sync_state is not None)
-    unmanaged = len(snapshot.gpx) - managed
     console.print(
-        f"  [green]✓[/green] {user_folder_count} folders, {len(snapshot.gpx)} GPX files "
-        f"([cyan]{managed}[/cyan] managed, [dim]{unmanaged} unmanaged[/dim])"
+        f"  [green]✓[/green] {len(manifest.folder_names)} folder(s), "
+        f"{len(manifest.entries)} entry(ies) "
+        f"[dim](synced {manifest.synced_at or 'never'}, cursor={manifest.stegra_cursor})[/dim]"
     )
-    console.print(f"  [dim]→ {out_path}[/dim]")
 
-    _print_dmd_overview(snapshot)
-
-
-def _print_dmd_overview(snapshot) -> None:  # type: ignore[no-untyped-def]
-    from .models import ROOT_FOLDER_ID
-    table = Table(title="DMD Hub Folders", show_lines=False)
+    table = Table(title=f"Local target: {target}", show_lines=False)
+    table.add_column("Collection ID", overflow="fold")
     table.add_column("Folder")
-    table.add_column("GPX", justify="right")
-    table.add_column("Managed", justify="right")
-
-    def row(folder) -> None:
-        managed = sum(1 for gid in folder.gpx_ids
-                       if snapshot.gpx.get(gid) and snapshot.gpx[gid].sync_state)
-        name = "[dim]Root[/dim]" if folder.id == ROOT_FOLDER_ID else folder.name
-        table.add_row(name, str(len(folder.gpx_ids)), str(managed))
-
-    # Root first, then sorted user folders
-    if ROOT_FOLDER_ID in snapshot.folders:
-        row(snapshot.folders[ROOT_FOLDER_ID])
-    for f in sorted(
-        (f for fid, f in snapshot.folders.items() if fid != ROOT_FOLDER_ID),
-        key=lambda x: x.name.lower(),
-    ):
-        row(f)
+    table.add_column("Entries", justify="right")
+    for cid, name in sorted(manifest.folder_names.items(),
+                              key=lambda kv: kv[1].lower()):
+        count = by_collection.get(cid, 0)
+        cid_label = cid if cid else "[dim](unsorted)[/dim]"
+        table.add_row(cid_label, name, str(count))
     console.print(table)
 
 
 @app.command()
 def plan(
+    target: Path = typer.Option(..., "--target", "-t",
+        help="Path to the local target folder."),
     workdir: Path = typer.Option(DEFAULT_WORKDIR, "--workdir", "-w"),
     verbose: bool = typer.Option(
         False, "--verbose", "-v",
-        help="Also list each action's reason and target.",
+        help="Also list each action's reason in the preview.",
     ),
 ) -> None:
-    """Diff Stegra snapshot vs DMD snapshot and emit a sync plan (dry-run)."""
+    """Diff Stegra snapshot vs the local target's manifest. Emits a plan."""
     snapshots_dir = workdir / "snapshots"
     plans_dir = workdir / "plans"
 
@@ -282,23 +255,19 @@ def plan(
         console.print("[yellow]No Stegra snapshot. Run `stegra-to-dmdhub-sync pull` first.[/yellow]")
         raise typer.Exit(code=2)
 
-    dmd_snapshot = dmd_mod.read_snapshot(snapshots_dir)
-    if dmd_snapshot is None:
-        console.print("[yellow]No DMD snapshot. Run `stegra-to-dmdhub-sync inspect` first.[/yellow]")
-        raise typer.Exit(code=2)
+    target.mkdir(parents=True, exist_ok=True)
+    manifest = local_target_mod.scan_target(target)
 
     console.print("[bold]→ Computing sync plan...[/bold]")
-    plan_obj = diff_mod.compute(stegra_snapshot, dmd_snapshot)
+    plan_obj = local_diff_mod.compute(stegra_snapshot, manifest, target)
 
-    # Write to disk with a timestamped filename
     plans_dir.mkdir(parents=True, exist_ok=True)
     ts = plan_obj.generated_at.replace(":", "").replace("-", "")[:15]
     out_path = plans_dir / f"plan-{ts}.json"
     _write_plan(plan_obj, out_path)
 
-    # Summary
     if not plan_obj.actions:
-        console.print("  [green]✓[/green] no actions — DMD is already in sync with Stegra")
+        console.print(f"  [green]✓[/green] no actions — {target} is already in sync with Stegra")
         console.print(f"  [dim]→ {out_path}[/dim]")
         return
 
@@ -309,7 +278,6 @@ def plan(
         + ", ".join(parts)
     )
     console.print(f"  [dim]→ {out_path}[/dim]")
-
     _print_plan_preview(plan_obj, verbose=verbose)
 
 
@@ -364,28 +332,141 @@ def _describe_action(a) -> str:  # type: ignore[no-untyped-def]
     if a.kind == "rename_folder":
         return f"Rename folder [dim]{p.get('old_name')}[/dim] → [cyan]{p.get('new_name')}[/cyan]"
     if a.kind == "delete_folder":
-        return f"Delete folder [red]{p.get('name')}[/red]"
+        return f"Delete folder [red]{p.get('folder_name', p.get('name'))}[/red]"
     if a.kind == "upload_gpx":
-        return (f"Upload [cyan]{p.get('stegra_route_name')}[/cyan] → "
-                f"[dim]{p.get('stegra_collection_name')}[/dim]")
-    if a.kind == "update_gpx_metadata":
-        return f"Update metadata on [cyan]{p.get('dmd_gpx_title')}[/cyan]"
+        replaces = p.get("replaces_relative_path")
+        action = "Update" if replaces else "Write"
+        return (f"{action} [cyan]{p.get('stegra_route_name')}[/cyan] → "
+                f"[dim]{p.get('relative_path')}[/dim]")
     if a.kind == "delete_gpx":
-        return f"Delete [red]{p.get('dmd_gpx_title')}[/red] [dim](orphan)[/dim]"
+        return f"Delete [red]{p.get('relative_path')}[/red] [dim](orphan)[/dim]"
     return f"{a.kind}: {p}"
 
 
 @app.command()
 def apply(
-    dry_run: bool = typer.Option(True, "--dry-run/--execute"),
+    target: Path = typer.Option(..., "--target", "-t",
+        help="Path to the local target folder."),
     workdir: Path = typer.Option(DEFAULT_WORKDIR, "--workdir", "-w"),
+    plan_file: Optional[Path] = typer.Option(
+        None, "--plan", help="Specific plan JSON to execute (default: latest in plans/).",
+    ),
+    execute: bool = typer.Option(
+        False, "--execute",
+        help="Actually perform the writes (default: dry-run preview only).",
+    ),
 ) -> None:
-    """[DISABLED in v1] Execute a sync plan."""
-    if not dry_run:
-        console.print("[red]Real writes are disabled in v1.[/red]")
+    """Execute a sync plan against the local target (default: dry-run preview)."""
+    snapshots_dir = workdir / "snapshots"
+    plans_dir = workdir / "plans"
+    gpx_dir = workdir / "gpx"
+
+    if plan_file is None:
+        plan_file = _latest_plan_file(plans_dir)
+        if plan_file is None:
+            console.print("[yellow]No plan found. Run `stegra-to-dmdhub-sync plan` first.[/yellow]")
+            raise typer.Exit(code=2)
+    if not plan_file.exists():
+        console.print(f"[red]Plan file not found: {plan_file}[/red]")
+        raise typer.Exit(code=2)
+    plan_obj = _load_plan(plan_file)
+    console.print(f"[dim]Plan: {plan_file}[/dim]")
+
+    if not plan_obj.actions:
+        console.print("  [green]✓[/green] plan has no actions — nothing to apply")
+        return
+
+    summary = plan_obj.summary()
+    parts = [f"{n} {k}" for k, n in summary.items()]
+    console.print(f"[bold]{len(plan_obj.actions)} action(s):[/bold] " + ", ".join(parts))
+    _print_plan_preview(plan_obj, verbose=False)
+
+    if not execute:
+        console.print(
+            "[yellow]Dry-run only.[/yellow] Re-run with [bold]--execute[/bold] to apply."
+        )
+        return
+
+    stegra_snapshot = stegra_mod.read_snapshot(snapshots_dir)
+    if stegra_snapshot is None:
+        console.print("[red]Stegra snapshot missing. Run `pull` again.[/red]")
+        raise typer.Exit(code=2)
+    target.mkdir(parents=True, exist_ok=True)
+    manifest = local_target_mod.scan_target(target)
+
+    destructive = summary.get("delete_gpx", 0) + summary.get("delete_folder", 0)
+    if destructive:
+        console.print(
+            f"[red]Performing {destructive} destructive action(s) on "
+            f"[bold]{target}[/bold][/red]"
+        )
+
+    console.print(f"[bold]→ Applying plan to {target}...[/bold]")
+    counts = {"ok": 0, "fail": 0, "skip": 0}
+    with Progress(
+        TextColumn("  "),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("[cyan]{task.fields[current]}[/cyan]"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        task_id = progress.add_task("apply", total=len(plan_obj.actions), current="")
+
+        def on_progress(kind: str, idx: int, total: int, label: str) -> None:
+            progress.update(task_id, advance=1, current=label)
+
+        result = local_apply_mod.execute_plan(
+            plan_obj, stegra_snapshot, manifest, target, gpx_dir,
+            on_progress=on_progress,
+        )
+    for r in result.results:
+        counts[r.status] += 1
+
+    table = Table(title="Apply results", show_lines=False)
+    table.add_column("")
+    table.add_column("Action")
+    table.add_column("Detail", overflow="fold")
+    for r in result.results:
+        icon = {"ok": "[green]✓[/green]", "fail": "[red]✗[/red]", "skip": "[yellow]-[/yellow]"}[r.status]
+        table.add_row(icon, r.action.kind, r.message)
+    console.print(table)
+
+    if result.halted:
+        console.print(
+            f"[red]Halted after {counts['fail']} failure(s).[/red] "
+            f"{counts['ok']} succeeded, {counts['skip']} skipped, "
+            f"{len(plan_obj.actions) - sum(counts.values())} not attempted."
+        )
+        console.print(
+            "[dim]Re-run `plan` to compute a fresh plan, then `apply` again.[/dim]"
+        )
         raise typer.Exit(code=1)
-    console.print("[yellow]apply --dry-run: depends on `plan` (not yet implemented).[/yellow]")
-    raise typer.Exit(code=1)
+
+    console.print(
+        f"[green]✓ Applied {counts['ok']} action(s) to {target}[/green]"
+        + (f" ({counts['skip']} skipped)" if counts['skip'] else "")
+    )
+    console.print("[dim]Run `plan` again to verify drift is zero.[/dim]")
+
+
+def _latest_plan_file(plans_dir: Path) -> Optional[Path]:
+    if not plans_dir.exists():
+        return None
+    plans = sorted(plans_dir.glob("plan-*.json"))
+    return plans[-1] if plans else None
+
+
+def _load_plan(path: Path) -> SyncPlan:
+    import json
+    from .plan import PlanAction
+    data = json.loads(path.read_text())
+    return SyncPlan(
+        dry_run=data.get("dry_run", True),
+        generated_at=data.get("generated_at", ""),
+        actions=[PlanAction(**a) for a in data.get("actions", [])],
+    )
 
 
 if __name__ == "__main__":

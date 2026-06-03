@@ -152,40 +152,15 @@ def bootstrap(
     else:
         print("  -> token OK (expiry unknown)")
 
-    cookies: dict[str, str] = {}
-    if paste_cookies:
-        # Skip auto-detection entirely
-        cookies = _prompt_cookies_via_devtools()
-    else:
-        print("Reading DMD Hub cookies from Chrome cookie store...")
-        auto_cookies, cookies_err = _read_dmd_cookies_from_chrome()
-        if auto_cookies and _cookies_look_useful(auto_cookies):
-            cookies = auto_cookies
-        elif auto_cookies and not _cookies_look_useful(auto_cookies):
-            names = ", ".join(sorted(auto_cookies))
-            print(f"  -> only got {len(auto_cookies)} cookies ({names}) — no session "
-                  "cookie")
-            print("     (typical symptom of macOS Chrome's Application-Bound Encryption "
-                  "blocking browser-cookie3)")
-            if allow_paste:
-                cookies = _prompt_cookies_via_devtools(seed=auto_cookies)
-            else:
-                raise AuthError("DMD cookies incomplete (paste disabled).")
-        else:
-            if not allow_paste:
-                raise AuthError(cookies_err or "Couldn't read DMD cookies.")
-            print(f"  -> {cookies_err or 'no cookies found'}")
-            cookies = _prompt_cookies_via_devtools()
-    if cookies:
-        names = ", ".join(sorted(cookies)[:6]) + ("..." if len(cookies) > 6 else "")
-        print(f"  -> {len(cookies)} cookies ({names})")
-    else:
-        raise AuthError("No DMD cookies captured.")
+    # DMD cookies aren't needed for the local-sync flow. The helper code
+    # (_read_dmd_cookies_from_chrome, _prompt_cookies_via_devtools) is left in
+    # place in case we revisit a remote target later.
+    _ = paste_cookies  # accepted for backwards compatibility
 
     bundle = AuthBundle(
         stegra_token=token,
         stegra_token_expires_at=exp,
-        dmd_cookies=cookies or {},
+        dmd_cookies={},
     )
     save(bundle)
     print(f"\nSaved {AUTH_PATH}")
