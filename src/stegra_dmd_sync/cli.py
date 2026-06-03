@@ -16,8 +16,10 @@ from rich.progress import (
 from rich.table import Table
 
 from . import auth as auth_mod
+from . import diff as diff_mod
 from . import dmd as dmd_mod
 from . import stegra as stegra_mod
+from .plan import SyncPlan
 
 app = typer.Typer(
     name="sync",
@@ -266,10 +268,111 @@ def _print_dmd_overview(snapshot) -> None:  # type: ignore[no-untyped-def]
 @app.command()
 def plan(
     workdir: Path = typer.Option(DEFAULT_WORKDIR, "--workdir", "-w"),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v",
+        help="Also list each action's reason and target.",
+    ),
 ) -> None:
-    """[STUB] Diff Stegra snapshot vs DMD snapshot, emit a sync plan."""
-    console.print("[yellow]plan: depends on `inspect` (not yet implemented).[/yellow]")
-    raise typer.Exit(code=1)
+    """Diff Stegra snapshot vs DMD snapshot and emit a sync plan (dry-run)."""
+    snapshots_dir = workdir / "snapshots"
+    plans_dir = workdir / "plans"
+
+    stegra_snapshot = stegra_mod.read_snapshot(snapshots_dir)
+    if stegra_snapshot is None:
+        console.print("[yellow]No Stegra snapshot. Run `stegra-to-dmdhub-sync pull` first.[/yellow]")
+        raise typer.Exit(code=2)
+
+    dmd_snapshot = dmd_mod.read_snapshot(snapshots_dir)
+    if dmd_snapshot is None:
+        console.print("[yellow]No DMD snapshot. Run `stegra-to-dmdhub-sync inspect` first.[/yellow]")
+        raise typer.Exit(code=2)
+
+    console.print("[bold]→ Computing sync plan...[/bold]")
+    plan_obj = diff_mod.compute(stegra_snapshot, dmd_snapshot)
+
+    # Write to disk with a timestamped filename
+    plans_dir.mkdir(parents=True, exist_ok=True)
+    ts = plan_obj.generated_at.replace(":", "").replace("-", "")[:15]
+    out_path = plans_dir / f"plan-{ts}.json"
+    _write_plan(plan_obj, out_path)
+
+    # Summary
+    if not plan_obj.actions:
+        console.print("  [green]✓[/green] no actions — DMD is already in sync with Stegra")
+        console.print(f"  [dim]→ {out_path}[/dim]")
+        return
+
+    summary = plan_obj.summary()
+    parts = [f"{n} {k}" for k, n in summary.items()]
+    console.print(
+        f"  [green]✓[/green] {len(plan_obj.actions)} action(s): "
+        + ", ".join(parts)
+    )
+    console.print(f"  [dim]→ {out_path}[/dim]")
+
+    _print_plan_preview(plan_obj, verbose=verbose)
+
+
+def _write_plan(plan_obj: SyncPlan, path: Path) -> None:
+    import json
+    from dataclasses import asdict
+    path.write_text(json.dumps({
+        "dry_run": plan_obj.dry_run,
+        "generated_at": plan_obj.generated_at,
+        "summary": plan_obj.summary(),
+        "actions": [asdict(a) for a in plan_obj.actions],
+    }, indent=2))
+
+
+def _print_plan_preview(plan_obj: SyncPlan, verbose: bool) -> None:
+    # Group by action kind for a tidy table
+    by_kind: dict[str, list] = {}
+    for action in plan_obj.actions:
+        by_kind.setdefault(action.kind, []).append(action)
+
+    icons = {
+        "create_folder": "📁＋",
+        "rename_folder": "📁✎",
+        "delete_folder": "📁－",
+        "upload_gpx": "⬆ ",
+        "update_gpx_metadata": "✎ ",
+        "delete_gpx": "🗑 ",
+    }
+
+    table = Table(title="Sync Plan (dry-run)", show_lines=False)
+    table.add_column("")
+    table.add_column("Item", overflow="fold")
+    if verbose:
+        table.add_column("Reason", overflow="fold")
+
+    for kind in ("create_folder", "rename_folder", "delete_folder",
+                  "upload_gpx", "update_gpx_metadata", "delete_gpx"):
+        actions = by_kind.get(kind, [])
+        for a in actions:
+            label = _describe_action(a)
+            row = [icons.get(kind, "•"), label]
+            if verbose:
+                row.append(f"[dim]{a.reason}[/dim]")
+            table.add_row(*row)
+    console.print(table)
+
+
+def _describe_action(a) -> str:  # type: ignore[no-untyped-def]
+    p = a.payload
+    if a.kind == "create_folder":
+        return f"Create folder [cyan]{p.get('name')}[/cyan]"
+    if a.kind == "rename_folder":
+        return f"Rename folder [dim]{p.get('old_name')}[/dim] → [cyan]{p.get('new_name')}[/cyan]"
+    if a.kind == "delete_folder":
+        return f"Delete folder [red]{p.get('name')}[/red]"
+    if a.kind == "upload_gpx":
+        return (f"Upload [cyan]{p.get('stegra_route_name')}[/cyan] → "
+                f"[dim]{p.get('stegra_collection_name')}[/dim]")
+    if a.kind == "update_gpx_metadata":
+        return f"Update metadata on [cyan]{p.get('dmd_gpx_title')}[/cyan]"
+    if a.kind == "delete_gpx":
+        return f"Delete [red]{p.get('dmd_gpx_title')}[/red] [dim](orphan)[/dim]"
+    return f"{a.kind}: {p}"
 
 
 @app.command()
