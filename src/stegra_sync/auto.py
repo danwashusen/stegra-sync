@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import os
+import re
 import stat
 import sys
 from dataclasses import asdict, dataclass
@@ -89,6 +90,10 @@ def first_run_setup(console: Console) -> AutoConfig:
     if not target.is_absolute():
         console.print(f"[red]Path must be absolute: {target}[/red]")
         raise typer.Exit(code=2)
+    err = _validate_target_writable(target)
+    if err:
+        console.print(f"[red]{err}[/red]")
+        raise typer.Exit(code=2)
 
     console.print(
         f"\n[bold]Where should snapshots and the GPX cache live?[/bold]\n"
@@ -122,7 +127,46 @@ def first_run_setup(console: Console) -> AutoConfig:
 
 
 def _expand_path(s: str) -> Path:
-    return Path(os.path.expanduser(os.path.expandvars(s.strip()))).resolve()
+    """Expand `~`/`$VAR`, strip shell-style quoting and escapes (`\\ `, `'...'`,
+    `"..."`), and resolve to an absolute Path. Plain paths with spaces are
+    preserved as-is."""
+    s = s.strip()
+    if len(s) >= 2 and (
+        (s.startswith('"') and s.endswith('"'))
+        or (s.startswith("'") and s.endswith("'"))
+    ):
+        # Surrounding quotes — strip and treat the contents literally.
+        s = s[1:-1]
+    elif "\\" in s:
+        # Backslash escapes — collapse each `\X` to `X`.
+        s = re.sub(r"\\(.)", r"\1", s)
+    return Path(os.path.expanduser(os.path.expandvars(s))).resolve()
+
+
+def _validate_target_writable(target: Path) -> Optional[str]:
+    """Return None if the target is usable, else a human-readable reason."""
+    # The target may already exist (typical case for cloud-synced folders),
+    # or not yet — in which case we need to be able to create it.
+    if target.exists():
+        if not target.is_dir():
+            return f"{target} exists but is not a directory."
+        if not os.access(target, os.W_OK):
+            return f"{target} is not writable."
+        return None
+    # Target doesn't exist; check that the parent does and is writable.
+    parent = target.parent
+    if not parent.exists():
+        return (
+            f"Parent folder does not exist: {parent}\n"
+            f"  Create it manually first, then re-run."
+        )
+    if not os.access(parent, os.W_OK):
+        return (
+            f"Parent folder is not writable: {parent}\n"
+            f"  (Cloud mounts like Google Drive sometimes refuse new top-level "
+            f"folders — create the destination manually first, then re-run.)"
+        )
+    return None
 
 
 # ---------- the full run ----------
@@ -135,8 +179,21 @@ def run_auto(config: AutoConfig, console: Console) -> int:
     plans_dir = workdir / "plans"
     gpx_dir = workdir / "gpx"
 
-    target.mkdir(parents=True, exist_ok=True)
-    workdir.mkdir(parents=True, exist_ok=True)
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except (OSError, PermissionError) as e:
+        console.print(
+            f"[red]Cannot create target {target}: {e}[/red]\n"
+            f"[dim]Hint: if the path contains spaces, drop any backslashes — the "
+            f"prompt is not a shell. Re-run with `stegra-sync auto --reset` to "
+            f"re-enter the path.[/dim]"
+        )
+        return 2
+    try:
+        workdir.mkdir(parents=True, exist_ok=True)
+    except (OSError, PermissionError) as e:
+        console.print(f"[red]Cannot create workdir {workdir}: {e}[/red]")
+        return 2
 
     # 1. Auth refresh
     bundle = _ensure_auth(config, console)
